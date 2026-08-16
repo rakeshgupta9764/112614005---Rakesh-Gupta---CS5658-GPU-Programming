@@ -1,0 +1,24 @@
+Found 1 CUDA device(s).
+
+CUDA Driver Version 13.0
+CUDA Runtime Version 12.9
+--- Device 0: NVIDIA GeForce 940MX ---
+  Compute Capability:                                  5.0
+  Total Global Memory:                                 2047 MB
+  Streaming Multiprocessors:                           3
+  Cores Per SM:                                        128
+  Total Cores:                                         384
+  GPU Max Clock Rate:                                  1.2415 GHz
+  Memory clock rate:                                   0.9 GHz
+  Memory Bus Width:                                    64 bits
+  L2 Cache size:                                       1024 KB
+  Total amount of constant memory:                     65536 bytes
+  Total amount of shared memory per block:             48 KB
+  Total shared memory per multiprocessor (SM):         65536 bytes
+  Total number of registers available per block:       65536
+  Warp size:                                           32
+  Max number of threads per multiprocessor (SM):       2048
+  Max number of threads per block:                     1024
+  Max dimension size of a grid:                        (2147483647, 65535, 65535)
+  Max dimension size of a thread block:                (1024, 1024, 64)
+
