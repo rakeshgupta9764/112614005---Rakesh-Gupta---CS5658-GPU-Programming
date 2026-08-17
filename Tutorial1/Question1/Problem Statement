@@ -1,0 +1,2 @@
+Write a program that implements barrier for all the
+threads of a CUDA kernel using __synchthreads and  atomic operations.
