@@ -1,0 +1,12 @@
+Block 2: BEFORE barrier
+Block 1: BEFORE barrier
+Block 0: BEFORE barrier
+Block 3: BEFORE barrier
+Block 0: ARRIVED, counter = 2
+Block 2: ARRIVED, counter = 1
+Block 1: ARRIVED, counter = 3
+Block 3: ARRIVED, counter = 4
+Block 2: PASSED barrier, counter = 4
+Block 1: PASSED barrier, counter = 4
+Block 0: PASSED barrier, counter = 4
+Block 3: PASSED barrier, counter = 4
