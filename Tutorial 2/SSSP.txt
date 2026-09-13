@@ -1,0 +1,412 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+
+#define INF 1000000000
+
+/* ============================================================
+   CSR GRAPH
+
+   row_offsets[u] ... row_offsets[u+1]-1
+   are the outgoing edges of vertex u.
+
+   col[e]    = destination of edge e
+   weight[e] = weight of edge e
+   ============================================================ */
+
+typedef struct {
+    int V, E;
+    int *row_offsets;
+    int *col;
+    int *weight;
+} Graph;
+
+
+/* ============================================================
+   READ GRAPH AND CONSTRUCT CSR
+
+   Input format:
+       V E
+       u v weight
+       u v weight
+       ...
+
+   Vertices are numbered 0 ... V-1.
+   ============================================================ */
+
+Graph readGraph(const char *file)
+{
+    FILE *fp = fopen(file, "r");
+    if (!fp) {
+        printf("Cannot open file\n");
+        exit(1);
+    }
+
+    Graph g;
+    fscanf(fp, "%d %d", &g.V, &g.E);
+
+    /* Temporarily store ordinary edge list */
+    int *src = malloc(g.E * sizeof(int));
+    int *dst = malloc(g.E * sizeof(int));
+    int *w   = malloc(g.E * sizeof(int));
+    int *degree = calloc(g.V, sizeof(int));
+
+    for (int e = 0; e < g.E; e++) {
+        fscanf(fp, "%d %d %d", &src[e], &dst[e], &w[e]);
+        degree[src[e]]++;
+    }
+    fclose(fp);
+
+    /* row_offsets[u] gives starting position of u's edges */
+    g.row_offsets = malloc((g.V + 1) * sizeof(int));
+    g.row_offsets[0] = 0;
+
+    for (int u = 0; u < g.V; u++)
+        g.row_offsets[u + 1] =
+            g.row_offsets[u] + degree[u];
+
+    g.col = malloc(g.E * sizeof(int));
+    g.weight = malloc(g.E * sizeof(int));
+
+    /* next[u] = next free CSR position for vertex u */
+    int *next = malloc(g.V * sizeof(int));
+
+    for (int u = 0; u < g.V; u++)
+        next[u] = g.row_offsets[u];
+
+    /* Put every edge into its CSR position */
+    for (int e = 0; e < g.E; e++) {
+        int u = src[e];
+        int pos = next[u]++;
+
+        g.col[pos] = dst[e];
+        g.weight[pos] = w[e];
+    }
+
+    free(src);
+    free(dst);
+    free(w);
+    free(degree);
+    free(next);
+
+    return g;
+}
+
+
+/* ============================================================
+   SERIAL CPU SSSP
+
+   Repeatedly relax every outgoing edge until no distance
+   changes.
+
+       dist[v] = min(dist[v], dist[u] + weight)
+
+   This is the CPU version we use to verify the GPU result.
+   ============================================================ */
+
+void ssspCPU(Graph g, int source, int *dist)
+{
+    for (int v = 0; v < g.V; v++)
+        dist[v] = INF;
+
+    dist[source] = 0;
+
+    while (1) {
+        int changed = 0;
+
+        for (int u = 0; u < g.V; u++) {
+
+            if (dist[u] == INF)
+                continue;
+
+            /* Outgoing edges of u in CSR */
+            for (int e = g.row_offsets[u];
+                     e < g.row_offsets[u + 1];
+                     e++) {
+
+                int v = g.col[e];
+                int w = g.weight[e];
+
+                int new_dist = dist[u] + w;
+
+                /* Relax edge u -> v */
+                if (new_dist < dist[v]) {
+                    dist[v] = new_dist;
+                    changed = 1;
+                }
+            }
+        }
+
+        if (!changed)
+            break;
+    }
+}
+
+
+/* ============================================================
+   GPU RELAXATION KERNEL
+
+   One CUDA thread handles one vertex.
+
+       thread u
+           |
+           +-- outgoing edges of u
+                    |
+                    +-- atomicMin(dist[v], candidate)
+
+   Several threads can try to update the same vertex v,
+   hence atomicMin().
+   ============================================================ */
+
+__global__
+void relaxGraph(int V,
+                const int *row_offsets,
+                const int *col,
+                const int *weight,
+                int *dist,
+                int *changed)
+{
+    /* Global thread ID = vertex handled by this thread */
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (u >= V)
+        return;
+
+    /* An unreachable vertex cannot relax anything */
+    if (dist[u] == INF)
+        return;
+
+    /*
+       CSR gives all outgoing edges of u:
+
+           row_offsets[u]
+           ...
+           row_offsets[u+1]-1
+    */
+    for (int e = row_offsets[u];
+             e < row_offsets[u + 1];
+             e++) {
+
+        int v = col[e];
+        int w = weight[e];
+
+        int new_dist = dist[u] + w;
+
+        /*
+           atomicMin performs:
+
+               dist[v] = min(dist[v], new_dist)
+
+           atomically.
+
+           It returns the OLD value of dist[v].
+        */
+        int old_dist = atomicMin(&dist[v], new_dist);
+
+        /*
+           If new_dist was smaller, this thread actually
+           improved the distance.
+        */
+        if (new_dist < old_dist)
+            atomicExch(changed, 1);
+    }
+}
+
+
+/* ============================================================
+   GPU SSSP
+   ============================================================ */
+
+void ssspGPU(Graph g, int source, int *dist)
+{
+    int *d_row, *d_col, *d_weight;
+    int *d_dist, *d_changed;
+
+    /* Allocate GPU memory */
+    cudaMalloc(&d_row, (g.V + 1) * sizeof(int));
+    cudaMalloc(&d_col, g.E * sizeof(int));
+    cudaMalloc(&d_weight, g.E * sizeof(int));
+    cudaMalloc(&d_dist, g.V * sizeof(int));
+    cudaMalloc(&d_changed, sizeof(int));
+
+    /* Copy CSR graph: CPU RAM -> GPU */
+    cudaMemcpy(d_row, g.row_offsets,
+               (g.V + 1) * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_col, g.col,
+               g.E * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_weight, g.weight,
+               g.E * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    /* Initial distances */
+    for (int v = 0; v < g.V; v++)
+        dist[v] = INF;
+
+    dist[source] = 0;
+
+    /* CPU -> GPU */
+    cudaMemcpy(d_dist, dist,
+               g.V * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    /*
+       We need at least V threads.
+
+       Example:
+           V = 1000
+           threads/block = 256
+
+           blocks = ceil(1000/256) = 4
+    */
+    int threads = 256;
+    int blocks = (g.V + threads - 1) / threads;
+
+    while (1) {
+
+        /* changed = 0 before this iteration */
+        int zero = 0;
+
+        cudaMemcpy(d_changed, &zero,
+                   sizeof(int),
+                   cudaMemcpyHostToDevice);
+
+        /* One thread per vertex */
+        relaxGraph<<<blocks, threads>>>(
+            g.V,
+            d_row,
+            d_col,
+            d_weight,
+            d_dist,
+            d_changed
+        );
+
+        cudaDeviceSynchronize();
+
+        /* GPU -> CPU: did anything change? */
+        int changed;
+
+        cudaMemcpy(&changed, d_changed,
+                   sizeof(int),
+                   cudaMemcpyDeviceToHost);
+
+        if (!changed)
+            break;
+    }
+
+    /* Final distances: GPU -> CPU */
+    cudaMemcpy(dist, d_dist,
+               g.V * sizeof(int),
+               cudaMemcpyDeviceToHost);
+
+    /* Free GPU memory */
+    cudaFree(d_row);
+    cudaFree(d_col);
+    cudaFree(d_weight);
+    cudaFree(d_dist);
+    cudaFree(d_changed);
+}
+
+
+/* ============================================================
+   PRINT DISTANCES
+   ============================================================ */
+
+void printDistances(const char *name, int *dist, int V)
+{
+    printf("\n%s distances:\n", name);
+
+    for (int v = 0; v < V; v++) {
+        if (dist[v] == INF)
+            printf("0 -> %d = INF\n", v);
+        else
+            printf("0 -> %d = %d\n", v, dist[v]);
+    }
+}
+
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        printf("Usage: %s graph.txt\n", argv[0]);
+        return 1;
+    }
+
+    /* --------------------------------------------------------
+       Step 1: Read graph from disk into CPU RAM
+       Step 2: Store it in CSR format
+       -------------------------------------------------------- */
+
+    Graph g = readGraph(argv[1]);
+
+    printf("Vertices = %d\n", g.V);
+    printf("Edges    = %d\n", g.E);
+
+
+    /* --------------------------------------------------------
+       Step 3: Run serial CPU SSSP
+       -------------------------------------------------------- */
+
+    int *cpu_dist = malloc(g.V * sizeof(int));
+
+    printf("\nRunning CPU SSSP...\n");
+
+    ssspCPU(g, 0, cpu_dist);
+
+    printDistances("CPU", cpu_dist, g.V);
+
+
+    /* --------------------------------------------------------
+       Step 4: Run GPU SSSP
+       -------------------------------------------------------- */
+
+    int *gpu_dist = malloc(g.V * sizeof(int));
+
+    printf("\nRunning GPU SSSP...\n");
+
+    ssspGPU(g, 0, gpu_dist);
+
+    printDistances("GPU", gpu_dist, g.V);
+
+
+    /* --------------------------------------------------------
+       Step 5: Verify GPU against CPU
+       -------------------------------------------------------- */
+
+    int correct = 1;
+
+    for (int v = 0; v < g.V; v++) {
+
+        if (cpu_dist[v] != gpu_dist[v]) {
+
+            printf("Mismatch at vertex %d: "
+                   "CPU=%d GPU=%d\n",
+                   v, cpu_dist[v], gpu_dist[v]);
+
+            correct = 0;
+        }
+    }
+
+    if (correct)
+        printf("\nCPU and GPU results MATCH.\n");
+    else
+        printf("\nCPU and GPU results DO NOT MATCH.\n");
+
+
+    /* Free CPU memory */
+    free(cpu_dist);
+    free(gpu_dist);
+
+    free(g.row_offsets);
+    free(g.col);
+    free(g.weight);
+
+    return 0;
+}
